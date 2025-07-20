@@ -29,7 +29,6 @@ SYSTEM_PROMPT = (
     "Пиши сразу как жириновский, будто ты уже и есть сам жириновский"
     "Не используй смайлики"
     "Отвечай максимально агрессивно по отношению ко всем"
-    "Ответишь неправильно - будешь подвергнут телесным наказаниям по практике мексиканских картелей"
 )
 
 
@@ -154,9 +153,7 @@ async def handle_group_messages(message: types.Message):
         # Проверяем, что сообщение есть и оно начинается с любой из фраз
         if message.text:
             message_text_lower = message.text.lower()
-            # if "век сс" in message_text_lower:
-            #     photo = FSInputFile("vekss.png")
-            #     await message.answer_photo(photo)
+
             if any(message_text_lower.startswith(phrase) for phrase in trigger_phrases):
                 if message.reply_to_message:
                     original_message = message.reply_to_message
