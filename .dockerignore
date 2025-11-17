@@ -1,5 +1,4 @@
 __pycache__
-.idea
 *.pyc
 *.pyo
 *.pyd
@@ -7,7 +6,6 @@ __pycache__
 env
 venv
 .venv
-.env
 .git
 .DS_Store
 *.log

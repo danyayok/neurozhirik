@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  zirinovski-bot:
+    build: .
+    container_name: ai_zhirik
+    restart: unless-stopped
+    volumes:
+      - ./config.py:/app/config.py:ro
+      - ./images.jpg:/app/images.jpg:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
