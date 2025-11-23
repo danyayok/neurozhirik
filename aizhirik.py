@@ -1,7 +1,9 @@
+import base64
 import logging
 import asyncio
 import time
 import aiohttp
+import requests
 from dataclasses import dataclass
 from typing import Optional, Dict
 from contextlib import suppress
@@ -15,7 +17,8 @@ from aiogram.types import FSInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from g4f.client import Client as G4FClient
-from config import BOT_TOKEN
+import random
+from config import BOT_TOKEN, OLLAMA_TOKEN, OLLAMA_HOST
 
 # Настройка логирования
 logging.basicConfig(
@@ -60,6 +63,102 @@ class ConversationContext:
     has_image: bool = False
     image_description: str = ""
 
+
+class AIClient:
+    """Клиент для работы с ИИ"""
+
+    def __init__(self, ollama_host: str, ollama_token: str):
+        self.ollama_host = ollama_host
+        self.ollama_token = ollama_token
+
+    async def analyze_image(self, image_data: bytes, request_id: str) -> Optional[str]:
+        """Анализирует изображение через Ollama"""
+        try:
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+
+            payload = {
+                "model": "qwen3-vl:235b",
+                "prompt": "Опиши это изображение максимально подробно на русском языке: что изображено, цвета, надписи, детали, эмоции если есть люди",
+                "stream": False,
+                "images": [image_base64],
+                "options": {
+                    "temperature": 0.3,
+                    "top_p": 0.9,
+                    "num_predict": 1500,
+                    "num_ctx": 4096
+                }
+            }
+
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {self.ollama_token}'
+            }
+
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(
+                    f"{self.ollama_host}/api/generate",
+                    headers=headers,
+                    json=payload,
+                    timeout=60
+                )
+            )
+
+            print(f"Status: {response.status_code}")
+
+            if response.status_code == 200:
+                data = response.json()
+                print("-" * 10)
+                print(f"Done reason: {data.get('done_reason')}")
+                print(f"Eval count: {data.get('eval_count')}")
+
+                # Сначала пробуем взять thinking, если есть и не пустой
+                thinking = data.get('thinking', '').strip()
+                if thinking:
+                    print(f"Thinking length: {len(thinking)}")
+                    return thinking
+
+                # Если thinking пустой, берем response
+                response_text = data.get('response', '').strip()
+                print(f"Response length: {len(response_text)}")
+                return response_text
+
+            print(f"Error: {response.text}")
+            return None
+
+        except Exception as e:
+            logger.warning(f"[{request_id}] Ошибка анализа изображения: {e}")
+            return None
+    async def generate_text_response(self, prompt: str, request_id: str) -> Optional[str]:
+        """Генерирует текстовый ответ через g4f"""
+        try:
+            logger.info(f"[{request_id}] Генерируем текст через g4f")
+
+            client = G4FClient()
+
+            for attempt in range(3):
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4",
+                        messages=[{"role": "user", "content": prompt}],
+                        timeout=30
+                    )
+
+                    result = response.choices[0].message.content
+                    if result and len(result.split()) < 200:
+                        logger.info(f"[{request_id}] ✅ Ответ от g4f получен")
+                        return result
+
+                except Exception as e:
+                    logger.warning(f"[{request_id}] g4f попытка {attempt + 1} ошибка: {e}")
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+
+            return None
+
+        except Exception as e:
+            logger.error(f"[{request_id}] g4f критическая ошибка: {e}")
+            return None
 
 class RequestManager:
     """Менеджер параллельных запросов"""
@@ -144,57 +243,23 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
 dp = Dispatcher(storage=MemoryStorage())
 request_manager = RequestManager(max_concurrent=config.MAX_CONCURRENT_REQUESTS)
 processor = MessageProcessor()
+ai_client = AIClient(OLLAMA_HOST, OLLAMA_TOKEN)
 
 
 async def analyze_image(image_url: str, request_id: str) -> Optional[str]:
     """Анализирует изображение и возвращает описание"""
     try:
-        logger.info(f"[{request_id}] Начинаем анализ изображения: {image_url}")
-
         async with aiohttp.ClientSession() as session:
             async with session.get(image_url, timeout=config.IMAGE_TIMEOUT) as response:
                 if response.status == 200:
                     image_data = await response.read()
-                    logger.info(f"[{request_id}] Изображение загружено, размер: {len(image_data)} байт")
 
-                    client = G4FClient(provider=g4f.Provider.PollinationsAI)
+                    # ТОЛЬКО Ollama для изображений
+                    ollama_description = await ai_client.analyze_image(image_data, request_id)
+                    return ollama_description
 
-                    # Пробуем разные модели для анализа изображения
-                    models_to_try = ["gpt-4o", "gpt-4", "gpt-3.5-turbo", "flux"]
-
-                    for model in models_to_try:
-                        try:
-                            logger.info(f"[{request_id}] Пробуем модель {model}")
-
-                            response = client.chat.completions.create(
-                                model=model,
-                                messages=[{
-                                    "role": "user",
-                                    "content": "Опиши это изображение максимально подробно: что изображено, цвета, надписи, детали, эмоции если есть люди"
-                                }],
-                                image=image_data,
-                                timeout=config.IMAGE_TIMEOUT
-                            )
-
-                            description = response.choices[0].message.content
-                            if description and len(description) > 10:
-                                logger.info(f"[{request_id}] Успешно проанализировано с моделью {model}")
-                                return description
-
-                        except Exception as model_error:
-                            logger.warning(f"[{request_id}] Модель {model} не сработала: {model_error}")
-                            continue
-
-                    logger.warning(f"[{request_id}] Ни одна модель не смогла проанализировать изображение")
-                    return None
-
-                else:
-                    logger.error(f"[{request_id}] Ошибка загрузки изображения: статус {response.status}")
-                    return None
-
-    except asyncio.TimeoutError:
-        logger.error(f"[{request_id}] Таймаут при анализе изображения")
         return None
+
     except Exception as e:
         logger.error(f"[{request_id}] Ошибка анализа изображения: {e}")
         return None
@@ -235,12 +300,10 @@ def build_conversation_context(original: types.Message, reply: types.Message, re
 
 @log_execution_time
 async def generate_jirinovsky_response(context: ConversationContext) -> str:
-    """Генерирует ответ в стиле Жириновского с обработкой изображений"""
+    """Генерирует ответ в стиле Жириновского"""
     try:
-        # Обработка изображений
         image_analysis = ""
 
-        # Проверяем и анализируем изображение в оригинальном сообщении
         if context.original_message and (context.original_message.photo or context.original_message.document):
             logger.info(f"[{context.request_id}] Обнаружено изображение, начинаем анализ")
 
@@ -248,47 +311,35 @@ async def generate_jirinovsky_response(context: ConversationContext) -> str:
             if image_url:
                 image_desc = await analyze_image(image_url, context.request_id)
                 if image_desc:
-                    image_analysis = f"\n\n[На изображении: {image_desc}]"
+                    image_analysis = f"\n[На изображении: {image_desc}]"
                     logger.info(f"[{context.request_id}] Изображение успешно проанализировано")
                 else:
                     logger.warning(f"[{context.request_id}] Не удалось получить описание изображения")
-                    image_analysis = "\n\n[Изображение не удалось проанализировать]"
-            else:
-                logger.info(f"[{context.request_id}] Изображение не найдено в сообщении")
+                    image_analysis = "\n[Изображение не удалось проанализировать]"
 
-        # Формируем финальный промпт
+        # Формируем промпт для ИИ
         prompt = (
             f"{config.SYSTEM_PROMPT}\n\n"
-            f"1. Оригинальное сообщение от {context.original_sender}: \"{context.original_text}{image_analysis}\"\n"
-            f"2. Ответ от {context.reply_sender} (тебе): \"{context.reply_text}\"\n\n"
-            f"Ответь {context.reply_sender} в стиле Жириновского!"
+            f"КОНТЕКСТ БЕСЕДЫ:\n"
+            f"1. Оригинальное сообщение от {context.original_sender}: \"{context.original_text}\""
+        )
+
+        if image_analysis:
+            prompt += f"{image_analysis}"
+
+        prompt += (
+            f"\n2. Ответ от {context.reply_sender} (тебе): \"{context.reply_text}\"\n\n"
+            f"ТВОЯ ЗАДАЧА: Ответь {context.reply_sender} в стиле Жириновского! Будь эмоционален, саркастичен и агрессивен!"
         )
 
         logger.info(f"[{context.request_id}] Генерируем ответ для {context.reply_sender}")
 
-        # Генерируем ответ
-        client = G4FClient()
-        for attempt in range(config.MAX_ATTEMPTS):
-            try:
-                logger.info(f"[{context.request_id}] Попытка генерации {attempt + 1}")
+        # ТОЛЬКО g4f для текста
+        response = await ai_client.generate_text_response(prompt, context.request_id)
 
-                response = client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[{"role": "user", "content": prompt}],
-                    timeout=config.REQUEST_TIMEOUT
-                )
-                result = response.choices[0].message.content
-
-                if result and len(result.split()) < 200:
-                    logger.info(f"[{context.request_id}] Успешно сгенерирован ответ")
-                    return result
-                else:
-                    logger.warning(f"[{context.request_id}] Ответ слишком длинный или пустой")
-
-            except Exception as e:
-                logger.error(f"[{context.request_id}] Попытка {attempt + 1} ошибка: {e}")
-                if attempt < config.MAX_ATTEMPTS - 1:
-                    await asyncio.sleep(1)
+        if response:
+            logger.info(f"[{context.request_id}] ✅ Успешно сгенерирован ответ")
+            return response
 
         logger.warning(f"[{context.request_id}] Все попытки провалились")
         return f"{context.reply_sender}, дорогой! Сейчас не до твоих вопросов! Система перегружена провокаторами!"
@@ -318,7 +369,6 @@ async def process_message_with_context(context: ConversationContext):
 
     except Exception as e:
         logger.error(f"[{context.request_id}] Ошибка отправки ответа: {e}")
-        # Пытаемся отправить сообщение об ошибке
         with suppress(Exception):
             await bot.send_message(
                 chat_id=context.chat_id,
@@ -330,9 +380,11 @@ async def process_message_with_context(context: ConversationContext):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     """Обработчик команды /start"""
+
     await message.answer(
-        "Дорогой! Я бот-Жириновский! Добавь меня в группу и упомяни в ответе на сообщение - "
-        "и я дам свой острый комментарий! Могу отвечать сразу нескольким провокаторам одновременно!"
+        f"Дорогой! Я бот-Жириновский!"
+        "Добавь меня в группу и упомяни в ответе на сообщение - "
+        "и я дам свой острый комментарий!"
     )
 
 
@@ -340,10 +392,10 @@ async def cmd_start(message: types.Message):
 async def cmd_status(message: types.Message):
     """Показать статус бота"""
     active_requests = await request_manager.get_active_count()
+
     await message.answer(
         f"Дорогой! Я работаю на полную мощность!\n"
         f"Активных запросов: {active_requests}\n"
-        f"Максимум параллельно: {config.MAX_CONCURRENT_REQUESTS}\n"
         f"Готов отвечать всем желающим получить порцию правды!"
     )
 
@@ -352,8 +404,13 @@ async def cmd_status(message: types.Message):
 async def cmd_ptichko(message: types.Message):
     """Обработчик команды /ptichko"""
     try:
-        photo = FSInputFile("images.jpg")
-        await message.answer_photo(photo, caption="Вот тебе птичка, дорогой! Не отвлекай от важных дел!")
+        rand_num = random.randint(1, 10)
+        if rand_num >= 9:
+            photo = FSInputFile("explode.jpg")
+            await message.answer_photo(photo, caption="Птичка взорвалась! Видимо, ты её взбесил, поганец")
+        else:
+            photo = FSInputFile("images.jpg")
+            await message.answer_photo(photo, caption="Вот тебе птичка, дорогой! Не отвлекай от важных дел!")
     except FileNotFoundError:
         await message.answer("Птичка улетела! Видимо, испугалась твоих вопросов!")
     except Exception as e:
@@ -363,7 +420,7 @@ async def cmd_ptichko(message: types.Message):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_group_messages(message: types.Message):
-    """Обработчик сообщений в группах - полностью асинхронный"""
+    """Обработчик сообщений в группах"""
     request_id = str(uuid.uuid4())[:8]
 
     try:
@@ -373,27 +430,20 @@ async def handle_group_messages(message: types.Message):
         if not processor.should_respond(message, bot_username):
             return
 
-        if not message.reply_to_message:
-            # Создаем задачу для отправки ответа без блокировки
-            await asyncio.create_task(
-                bot.send_message(
-                    chat_id=message.chat.id,
-                    text="Дорогой, ты что, не знаешь как работает система? Ответь на сообщение и тогда зови меня!",
-                    reply_to_message_id=message.message_id
-                )
-            )
-            return
+        # if not message.reply_to_message:
+        #     await message.reply(
+        #         "Дорогой, ты что, не знаешь как работает система? Ответь на сообщение и тогда зови меня!")
+        #     return
 
-        # Создаем контекст для асинхронной обработки
         context = build_conversation_context(
             message.reply_to_message,
             message,
             request_id
         )
 
-        logger.info(f"[{request_id}] Запускаем асинхронную обработку для {context.reply_sender}")
+        logger.info(f"[{request_id}] Запускаем обработку для {context.reply_sender}")
 
-        # Запускаем асинхронную обработку через менеджер запросов
+        # Запускаем асинхронную обработку
         await asyncio.create_task(
             request_manager.process_request(
                 request_id,
@@ -401,53 +451,20 @@ async def handle_group_messages(message: types.Message):
             )
         )
 
-        # Сразу отправляем подтверждение получения запроса
-        await asyncio.create_task(
-            bot.send_chat_action(message.chat.id, "typing")
-        )
+        await bot.send_chat_action(message.chat.id, "typing")
 
     except Exception as e:
         logger.error(f"[{request_id}] Ошибка обработки сообщения: {e}")
-        # Асинхронно отправляем сообщение об ошибке
-        await asyncio.create_task(
-            bot.send_message(
-                chat_id=message.chat.id,
-                text="Пфф! Провокация! Не могу обработать этот запрос!",
-                reply_to_message_id=message.message_id
-            )
-        )
+        await message.reply("Пфф! Провокация! Не могу обработать этот запрос!")
 
 
 @dp.message(F.chat.type == "private")
 async def handle_private_messages(message: types.Message):
     """Обработчик личных сообщений"""
     await message.answer(
-        "Дорогой! Я работаю только в группах! Ты что, одинокий волк? "
-        "Добавь меня в группу, собери аудиторию, и тогда я покажу всю свою мощь! "
-        "Могу отвечать сразу нескольким участникам - проверь мою скорость!"
+        "Дорогой! Я работаю только в группах! "
+        "Добавь меня в группу, собери аудиторию, и тогда я покажу всю свою мощь!"
     )
-
-
-@dp.message(Command("test_image"))
-async def cmd_test_image(message: types.Message):
-    """Тестовая команда для проверки анализа изображений"""
-    if message.reply_to_message and (message.reply_to_message.photo or message.reply_to_message.document):
-        request_id = "test_image_" + str(uuid.uuid4())[:8]
-        context = build_conversation_context(
-            message.reply_to_message,
-            message,
-            request_id
-        )
-
-        await asyncio.create_task(
-            request_manager.process_request(
-                request_id,
-                process_message_with_context(context)
-            )
-        )
-        await message.reply("Тестирую анализ изображения...")
-    else:
-        await message.reply("Ответь на сообщение с изображением для теста!")
 
 
 async def on_startup():
@@ -456,22 +473,16 @@ async def on_startup():
     logger.info("=" * 50)
     logger.info("🚀 Бот запущен!")
     logger.info(f"🤖 Username: @{bot_info.username}")
-    logger.info(f"🆔 ID: {bot_info.id}")
-    logger.info(f"📝 Имя: {bot_info.full_name}")
-    logger.info(f"⚡ Максимум параллельных запросов: {config.MAX_CONCURRENT_REQUESTS}")
     logger.info("=" * 50)
 
 
 async def on_shutdown():
     """Действия при остановке бота"""
-    logger.info("🛑 Бот останавливается... Отменяем активные задачи...")
-
-    # Ждем завершения активных задач (с таймаутом)
+    logger.info("🛑 Бот останавливается...")
     active_count = await request_manager.get_active_count()
     if active_count > 0:
         logger.info(f"⏳ Ожидаем завершения {active_count} активных запросов...")
-        await asyncio.sleep(2)  # Даем время на завершение
-
+        await asyncio.sleep(2)
     logger.info("✅ Бот успешно остановлен!")
 
 
@@ -482,11 +493,11 @@ async def main():
         dp.shutdown.register(on_shutdown)
 
         await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("🌐 Вебхук удален, начинаем асинхронный поллинг...")
+        logger.info("🌐 Начинаем поллинг...")
         await dp.start_polling(bot)
 
     except Exception as e:
-        logger.error(f"💥 Критическая ошибка при запуске бота: {e}")
+        logger.error(f"💥 Критическая ошибка: {e}")
     finally:
         await bot.session.close()
 

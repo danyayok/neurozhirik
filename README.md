@@ -26,6 +26,9 @@
 
 # Создайте бота через @BotFather
 # Получите BOT_TOKEN
+
+# Зайдите на https://ollama.com/
+# Создайте аккаунт и API-ключ
 ```
 
 ### 2. Настройка окружения
@@ -42,6 +45,8 @@ nano .env
 API_ID=ваш_api_id
 API_HASH=ваш_api_hash
 BOT_TOKEN=ваш_bot_token
+OLLAMA_HOST=https://ollama.com
+OLLAMA_TOKEN="ваш_ollama_токен"
 ```
 
 ### 3. Запуск
