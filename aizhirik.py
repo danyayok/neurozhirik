@@ -430,10 +430,8 @@ async def handle_group_messages(message: types.Message):
         if not processor.should_respond(message, bot_username):
             return
 
-        # if not message.reply_to_message:
-        #     await message.reply(
-        #         "Дорогой, ты что, не знаешь как работает система? Ответь на сообщение и тогда зови меня!")
-        #     return
+        if not message.reply_to_message:
+            return
 
         context = build_conversation_context(
             message.reply_to_message,
