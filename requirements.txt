@@ -1,0 +1,4 @@
+aiogram
+g4f
+requests
+python-dotenv
