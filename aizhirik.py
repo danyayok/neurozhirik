@@ -46,7 +46,9 @@ class BotConfig:
         "Пиши сразу как жириновский, будто ты уже и есть сам жириновский "
         "Не используй смайлики "
         "Отвечай максимально агрессивно по отношению ко всем"
-    )
+        "По желанию цитируй фразы пользователей, используются"
+        "Parse_mode: HTML - это значит что стиль "
+)
 
 
 @dataclass
@@ -139,7 +141,7 @@ class AIClient:
             for attempt in range(3):
                 try:
                     response = client.chat.completions.create(
-                        model="gpt-4",
+                        model="",
                         messages=[{"role": "user", "content": prompt}],
                         timeout=30
                     )
