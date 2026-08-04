@@ -65,101 +65,199 @@ class ConversationContext:
     image_description: str = ""
 
 
+import time
+import inspect
+import g4f.Provider
+from g4f.providers.base_provider import BaseProvider
+
+
+import time
+import inspect
+import g4f.Provider
+from g4f.providers.base_provider import BaseProvider
+
+
+class DynamicProviderManager:
+    """Динамический менеджер провайдеров с кешированием и временным баном (cooldown)"""
+
+    def __init__(self, cooldown_seconds: int = 1800):
+        # cooldown_seconds = 1800 (30 минут бана для упавшего провайдера)
+        self.cooldown_seconds = cooldown_seconds
+        self.working_provider = None
+
+        # Словарь заблокированных провайдеров: {КлассПровайдера: время_когда_можно_разбанить}
+        self.banned_providers = {}
+
+        # Автоматически собираем все доступные рабочие классы провайдеров из g4f
+        self.all_providers = [
+            attr for attr_name in dir(g4f.Provider)
+            if isinstance(attr := getattr(g4f.Provider, attr_name), type)
+               and issubclass(attr, BaseProvider)
+               and attr is not BaseProvider
+               and getattr(attr, 'working', True)
+        ]
+        logger.info(f"Загружено {len(self.all_providers)} потенциальных провайдеров g4f")
+
+    def get_working_provider(self):
+        """Возвращает текущий закешированный провайдер"""
+        return self.working_provider
+
+    def set_working_provider(self, provider):
+        """Закрепляет рабочий провайдер"""
+        self.working_provider = provider
+        logger.info(f"📌 Закреплен рабочий провайдер: {provider.__name__}")
+
+    def ban_provider(self, provider):
+        """Отправляет провайдера в «бан» на определенное время"""
+        unban_time = time.time() + self.cooldown_seconds
+        self.banned_providers[provider] = unban_time
+
+        # Если упал именно тот, что был закеширован — сбрасываем кеш
+        if self.working_provider == provider:
+            self.working_provider = None
+
+        logger.warning(
+            f"⚠️ Провайдер {provider.__name__} забанен на {self.cooldown_seconds // 60} минут "
+            f"(до {time.strftime('%H:%M:%S', time.localtime(unban_time))})"
+        )
+
+    def get_available_providers(self):
+        """Возвращает список провайдеров, у которых ИСТЕК срок бана"""
+        now = time.time()
+        available = []
+
+        for provider in self.all_providers:
+            if provider in self.banned_providers:
+                if now >= self.banned_providers[provider]:
+                    del self.banned_providers[provider]  # Снимаем бан
+                    logger.info(f"🔄 Провайдер {provider.__name__} разбанен и возвращен в строй!")
+                    available.append(provider)
+            else:
+                available.append(provider)
+
+        return available
+
+
 class AIClient:
     """Клиент для работы с ИИ"""
 
     def __init__(self, ollama_host: str, ollama_token: str):
         self.ollama_host = ollama_host
         self.ollama_token = ollama_token
+        # 1. Инициализируем менеджер провайдеров
+        self.provider_manager = DynamicProviderManager()
 
     async def analyze_image(self, image_data: bytes, request_id: str) -> Optional[str]:
-        """Анализирует изображение через Ollama"""
+        """Анализирует изображение через Ollama Cloud API"""
         try:
             image_base64 = base64.b64encode(image_data).decode('utf-8')
 
             payload = {
-                "model": "qwen3-vl:235b",
-                "prompt": "Опиши это изображение максимально подробно на русском языке: что изображено, цвета, надписи, детали, эмоции если есть люди",
+                "model": "minimax-m3",  # или glm-4.7:cloud / другая мультимодальная модель
+                "prompt": "**До сотни слов**. Опиши кратко и емко, что на фото. Выдели главное: объекты, **персонажи по именам *ЕСЛИ ЗНАЕШЬ ИХ* ** и что на фото происходит. .",
                 "stream": False,
                 "images": [image_base64],
                 "options": {
                     "temperature": 0.3,
                     "top_p": 0.9,
                     "num_predict": 1500,
-                    "num_ctx": 4096
+                    "num_ctx": 1000
                 }
             }
 
+            # Формируем правильные заголовки с авторизацией
             headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {self.ollama_token}'
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Authorization": f"Bearer {self.ollama_token}"
             }
 
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: requests.post(
-                    f"{self.ollama_host}/api/generate",
-                    headers=headers,
-                    json=payload,
-                    timeout=60
-                )
-            )
+            url = f"{self.ollama_host.rstrip('/')}/api/generate"
 
-            print(f"Status: {response.status_code}")
+            # Используем асинхронный aiohttp вместо синхронного requests
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload, timeout=60) as response:
+                    print(response)
+                    if response.status == 200:
+                        data = await response.json()
 
-            if response.status_code == 200:
-                data = response.json()
-                print("-" * 10)
-                print(f"Done reason: {data.get('done_reason')}")
-                print(f"Eval count: {data.get('eval_count')}")
+                        # Получаем итоговый ответ
+                        response_text = data.get('response', '').strip()
+                        if not response_text:
+                            response_text = data.get('thinking', '').strip()
+                        print(response_text)
+                        return response_text
 
-                # Сначала пробуем взять thinking, если есть и не пустой
-                thinking = data.get('thinking', '').strip()
-                if thinking:
-                    print(f"Thinking length: {len(thinking)}")
-                    return thinking
-
-                # Если thinking пустой, берем response
-                response_text = data.get('response', '').strip()
-                print(f"Response length: {len(response_text)}")
-                return response_text
-
-            print(f"Error: {response.text}")
-            return None
+                    # Если сервер вернул ошибку (401, 403, 500 и т.д.)
+                    error_body = await response.text()
+                    logger.error(f"[{request_id}] Ошибка Ollama API [{response.status}]: {error_body}")
+                    return None
 
         except Exception as e:
             logger.warning(f"[{request_id}] Ошибка анализа изображения: {e}")
             return None
+    # 2. Добавлен неблокирующий метод выполнения запроса в отдельном потоке
+    async def _try_generate(self, client: G4FClient, prompt: str, provider) -> Optional[str]:
+        """Запускает синхронный вызов g4f в отдельном потоке executor"""
+        loop = asyncio.get_running_loop()
+
+        def _sync_call():
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                provider=provider,
+                messages=[{"role": "user", "content": prompt}],
+                timeout=20
+            )
+            return response.choices[0].message.content
+
+        return await loop.run_in_executor(None, _sync_call)
+
     async def generate_text_response(self, prompt: str, request_id: str) -> Optional[str]:
-        """Генерирует текстовый ответ через g4f"""
-        try:
-            logger.info(f"[{request_id}] Генерируем текст через g4f")
+        """Генерирует текстовый ответ с автоматическим выбором и баном провайдеров"""
+        client = G4FClient()
 
-            client = G4FClient()
+        # Шаг A: Пробуем закешированного проверенного провайдера
+        cached_provider = self.provider_manager.get_working_provider()
+        if cached_provider:
+            try:
+                logger.info(f"[{request_id}] Пробуем сохраненный провайдер: {cached_provider.__name__}")
+                result = await self._try_generate(client, prompt, cached_provider)
+                if result and len(result.strip()) > 0:
+                    return result
+            except Exception as e:
+                logger.warning(f"[{request_id}] Сохраненный {cached_provider.__name__} выбил ошибку. Бан за сбой!")
+                self.provider_manager.ban_provider(cached_provider)
 
-            for attempt in range(3):
-                try:
-                    response = client.chat.completions.create(
-                        model="",
-                        messages=[{"role": "user", "content": prompt}],
-                        timeout=30
-                    )
+        # Шаг B: Если кеша нет или он сбоил — ищем нового из незабаненных
+        available_providers = self.provider_manager.get_available_providers()
+        logger.info(f"[{request_id}] Поиск среди {len(available_providers)} доступных провайдеров...")
 
-                    result = response.choices[0].message.content
-                    if result and len(result.split()) < 200:
-                        logger.info(f"[{request_id}] ✅ Ответ от g4f получен")
-                        return result
+        for provider in available_providers:
+            try:
+                result = await self._try_generate(client, prompt, provider)
+                res_clean = result.strip()
+                res_lower = res_clean.lower()
 
-                except Exception as e:
-                    logger.warning(f"[{request_id}] g4f попытка {attempt + 1} ошибка: {e}")
-                    if attempt < 2:
-                        await asyncio.sleep(1)
+                STOP_PHRASES = [
+                    "я не могу", "не могу сгенерировать", "как языковая модель",
+                    "не могу отвечать", "нарушает правила", "безопасная художественная",
+                    "не имею возможности", "к сожалению, я не", "в агрессивной манере"
+                ]
 
-            return None
+                is_refusal_start = res_lower.startswith(("к сожалению", "я не могу", "я не имею"))
+                has_stop_words = any(phrase in res_lower for phrase in STOP_PHRASES)
 
-        except Exception as e:
-            logger.error(f"[{request_id}] g4f критическая ошибка: {e}")
-            return None
+                if len(res_clean) > 10 and not has_stop_words and not is_refusal_start:
+                    self.provider_manager.set_working_provider(provider)
+                    logger.info(f"[{request_id}] ✅ Ответ получен от {provider.__name__}")
+                    return result
+
+            except Exception:
+                self.provider_manager.ban_provider(provider)
+                continue
+
+        logger.error(f"[{request_id}] ❌ Ни один из доступных провайдеров не ответил!")
+        return None
 
 class RequestManager:
     """Менеджер параллельных запросов"""
@@ -254,8 +352,6 @@ async def analyze_image(image_url: str, request_id: str) -> Optional[str]:
             async with session.get(image_url, timeout=config.IMAGE_TIMEOUT) as response:
                 if response.status == 200:
                     image_data = await response.read()
-
-                    # ТОЛЬКО Ollama для изображений
                     ollama_description = await ai_client.analyze_image(image_data, request_id)
                     return ollama_description
 
@@ -315,7 +411,7 @@ async def generate_jirinovsky_response(context: ConversationContext) -> str:
                     image_analysis = f"\n[На изображении: {image_desc}]"
                     logger.info(f"[{context.request_id}] Изображение успешно проанализировано")
                 else:
-                    logger.warning(f"[{context.request_id}] Не удалось получить описание изображения")
+                    logger.warning(f"[{context.request_id}] Не удалось получить описание изображения.")
                     image_analysis = "\n[Изображение не удалось проанализировать]"
 
         # Формируем промпт для ИИ
