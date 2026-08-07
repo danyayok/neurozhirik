@@ -222,10 +222,11 @@ class AIClient:
                     timeout=20
                 )
 
-                # Проверяем, что response существует и не равен None
+                # 1. Если провайдер вернул None — сразу выходим, не опрашивая атрибуты
                 if response is None:
                     return None
 
+                # 2. Безопасно проверяем наличие choices
                 if hasattr(response, 'choices') and response.choices:
                     return response.choices[0].message.content
                 elif isinstance(response, str):
