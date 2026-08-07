@@ -249,9 +249,9 @@ class AIClient:
                 STOP_PHRASES = [
                     "я не могу", "не могу сгенерировать", "как языковая модель",
                     "не могу отвечать", "нарушает правила", "безопасная художественная",
-                    "не имею возможности", "к сожалению, я не", "в агрессивной манере", "'NoneType' object has no attribute 'choices'"
+                    "не имею возможности", "к сожалению, я не", "в агрессивной манере", "nonetype", "has no attribute", "traceback",
+                    "exception", "rate limit", "service unavailable"
                 ]
-
                 is_refusal_start = res_lower.startswith(("к сожалению", "я не могу", "я не имею"))
                 has_stop_words = any(phrase in res_lower for phrase in STOP_PHRASES)
 
