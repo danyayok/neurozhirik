@@ -70,6 +70,24 @@ import time
 import inspect
 import g4f.Provider
 from g4f.providers.base_provider import BaseProvider
+import re
+import html
+
+
+def clean_telegram_html(text: str) -> str:
+    if not text:
+        return ""
+    # Удаляем любые теги <span>, если это не class="tg-spoiler"
+    # Экранируем невалидные теги span или просто вырезаем их
+    text = re.sub(r'<span(?![^>]*class=["\']tg-spoiler["\'])[^>]*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</span>', '', text, flags=re.IGNORECASE)
+
+    # Вырезаем любые другие не поддерживаемые Telegram HTML-теги (div, p, style и т.д.)
+    # Telegram поддерживает только: b, strong, i, em, u, ins, s, strike, del, span (с tg-spoiler), a, code, pre
+    allowed_tags_pattern = r'</?(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|blockquote|tg-spoiler|span class="tg-spoiler")[^>]*>'
+
+    # Для безопасности убираем вредоносный HTML
+    return text
 
 class DynamicProviderManager:
     """Динамический менеджер провайдеров с кешированием и временным баном (cooldown)"""
@@ -460,11 +478,11 @@ async def process_message_with_context(context: ConversationContext):
 
         # Генерируем ответ
         response = await generate_jirinovsky_response(context)
-
+        clean_response = clean_telegram_html(response)
         # Отправляем ответ
         await bot.send_message(
             chat_id=context.chat_id,
-            text=response,
+            text=clean_response,
             reply_to_message_id=context.message_id
         )
 
