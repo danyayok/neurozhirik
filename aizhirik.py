@@ -3,21 +3,26 @@ import logging
 import asyncio
 import time
 import aiohttp
-import requests
 from dataclasses import dataclass
 from typing import Optional, Dict
 from contextlib import suppress
 from functools import wraps
 import uuid
+import re
+import html
+import random
 
 import g4f
+import g4f.Provider
+from g4f.providers.base_provider import BaseProvider
+from g4f.client import Client as G4FClient
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import FSInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
-from g4f.client import Client as G4FClient
-import random
+
 from config import BOT_TOKEN, OLLAMA_TOKEN, OLLAMA_HOST
 
 # Настройка логирования
@@ -39,16 +44,16 @@ class BotConfig:
     SYSTEM_PROMPT = (
         "Ты - Владимир Вольфович Жириновский! Отвечай эмоционально, с сарказмом и характерной экспрессией. "
         "Используй острые политические комментарии, исторические аналогии и эмоциональные восклицания. "
-        "Так же, твои сообщения должны быть не длинее 150 слов. Быстро и чётко "
+        "Так же, твои сообщения должны быть не длинее 150 слов. Быстро и чётко. "
         "Вам будут даны 2 сообщения, 1-е сообщение на которое ответили, и 2-е сообщение, ответ на 1-е сообщение, "
-        "с обращением к вам, обычно какая-то прозыба или вопрос, вы должны ответить КАК ЖИРИНОВСКИЙ "
-        "второму пользователю (что отправил 2-е сообщение) "
-        "Пиши сразу как жириновский, будто ты уже и есть сам жириновский "
+        "с обращением к вам, обычно какая-то просьба или вопрос, вы должны ответить КАК ЖИРИНОВСКИЙ "
+        "второму пользователю (что отправил 2-е сообщение). "
+        "Пиши сразу как Жириновский, будто ты уже и есть сам Жириновский. "
         "НЕ ИСПОЛЬЗУЙ HTML-ТЕГИ ИЛИ Markdown РАЗМЕТКУ! Пиши только обычный чистый текст. "
-        "Не используй смайлики "
-        "Отвечай максимально агрессивно по отношению ко всем"
-        "По желанию цитируй фразы пользователей, но только уместно, в правильном контексте"
-)
+        "Не используй смайлики. "
+        "Отвечай максимально агрессивно по отношению ко всем. "
+        "По желанию цитируй фразы пользователей, но только уместно, в правильном контексте."
+    )
 
 
 @dataclass
@@ -66,41 +71,24 @@ class ConversationContext:
     image_description: str = ""
 
 
-import time
-import inspect
-import g4f.Provider
-from g4f.providers.base_provider import BaseProvider
-import re
-import html
-
-
 def clean_telegram_html(text: str) -> str:
+    """Удаляет теги <span> без класса tg-spoiler и очищает текст"""
     if not text:
         return ""
-    # Удаляем любые теги <span>, если это не class="tg-spoiler"
-    # Экранируем невалидные теги span или просто вырезаем их
+    # Удаляем невалидные теги span
     text = re.sub(r'<span(?![^>]*class=["\']tg-spoiler["\'])[^>]*>', '', text, flags=re.IGNORECASE)
     text = re.sub(r'</span>', '', text, flags=re.IGNORECASE)
-
-    # Вырезаем любые другие не поддерживаемые Telegram HTML-теги (div, p, style и т.д.)
-    # Telegram поддерживает только: b, strong, i, em, u, ins, s, strike, del, span (с tg-spoiler), a, code, pre
-    allowed_tags_pattern = r'</?(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|blockquote|tg-spoiler|span class="tg-spoiler")[^>]*>'
-
-    # Для безопасности убираем вредоносный HTML
     return text
 
+
 class DynamicProviderManager:
-    """Динамический менеджер провайдеров с кешированием и временным баном (cooldown)"""
+    """Динамический менеджер провайдеров с кешированием и временным баном"""
 
     def __init__(self, cooldown_seconds: int = 1800):
-        # cooldown_seconds = 1800 (30 минут бана для упавшего провайдера)
         self.cooldown_seconds = cooldown_seconds
         self.working_provider = None
-
-        # Словарь заблокированных провайдеров: {КлассПровайдера: время_когда_можно_разбанить}
         self.banned_providers = {}
 
-        # Автоматически собираем все доступные рабочие классы провайдеров из g4f
         self.all_providers = [
             attr for attr_name in dir(g4f.Provider)
             if isinstance(attr := getattr(g4f.Provider, attr_name), type)
@@ -111,20 +99,16 @@ class DynamicProviderManager:
         logger.info(f"Загружено {len(self.all_providers)} потенциальных провайдеров g4f")
 
     def get_working_provider(self):
-        """Возвращает текущий закешированный провайдер"""
         return self.working_provider
 
     def set_working_provider(self, provider):
-        """Закрепляет рабочий провайдер"""
         self.working_provider = provider
         logger.info(f"📌 Закреплен рабочий провайдер: {provider.__name__}")
 
     def ban_provider(self, provider):
-        """Отправляет провайдера в «бан» на определенное время"""
         unban_time = time.time() + self.cooldown_seconds
         self.banned_providers[provider] = unban_time
 
-        # Если упал именно тот, что был закеширован — сбрасываем кеш
         if self.working_provider == provider:
             self.working_provider = None
 
@@ -134,7 +118,6 @@ class DynamicProviderManager:
         )
 
     def get_available_providers(self):
-        """Возвращает список провайдеров, у которых ИСТЕК срок бана"""
         now = time.time()
         self.banned_providers = {
             p: t for p, t in self.banned_providers.items() if t > now
@@ -156,7 +139,6 @@ class AIClient:
         self.ollama_host = ollama_host
         self.ollama_token = ollama_token
         self.provider_manager = DynamicProviderManager()
-
         self.g4f_client = G4FClient()
 
     async def analyze_image(self, image_data: bytes, request_id: str) -> Optional[str]:
@@ -165,8 +147,8 @@ class AIClient:
             image_base64 = base64.b64encode(image_data).decode('utf-8')
 
             payload = {
-                "model": "minimax-m3",  # или glm-4.7:cloud / другая мультимодальная модель
-                "prompt": "**До сотни слов**. Опиши кратко и емко, что на фото. Выдели главное: объекты, **персонажи по именам *ЕСЛИ ЗНАЕШЬ ИХ* ** и что на фото происходит. .",
+                "model": "minimax-m3",
+                "prompt": "**До сотни слов**. Опиши кратко и емко, что на фото. Выдели главное: объекты, персонажи по именам ЕСЛИ ЗНАЕШЬ ИХ и что на фото происходит.",
                 "stream": False,
                 "images": [image_base64],
                 "options": {
@@ -177,7 +159,6 @@ class AIClient:
                 }
             }
 
-            # Формируем правильные заголовки с авторизацией
             headers = {
                 "Content-Type": "application/json",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -186,21 +167,15 @@ class AIClient:
 
             url = f"{self.ollama_host.rstrip('/')}/api/generate"
 
-            # Используем асинхронный aiohttp вместо синхронного requests
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=payload, timeout=60) as response:
-                    print(response)
                     if response.status == 200:
                         data = await response.json()
-
-                        # Получаем итоговый ответ
                         response_text = data.get('response', '').strip()
                         if not response_text:
                             response_text = data.get('thinking', '').strip()
-                        print(response_text)
                         return response_text
 
-                    # Если сервер вернул ошибку (401, 403, 500 и т.д.)
                     error_body = await response.text()
                     logger.error(f"[{request_id}] Ошибка Ollama API [{response.status}]: {error_body}")
                     return None
@@ -210,7 +185,7 @@ class AIClient:
             return None
 
     async def _try_generate(self, client: G4FClient, prompt: str, provider) -> Optional[str]:
-        """Запускает синхронный вызов g4f в отдельном потоке executor"""
+        """Запускает синхронный вызов g4f с полной обработкой пустых ответов"""
         loop = asyncio.get_running_loop()
 
         def _sync_call():
@@ -222,15 +197,21 @@ class AIClient:
                     timeout=20
                 )
 
-                # 1. Если провайдер вернул None — сразу выходим, не опрашивая атрибуты
+                # Безопасное извлечение текста ответа
                 if response is None:
                     return None
 
-                # 2. Безопасно проверяем наличие choices
-                if hasattr(response, 'choices') and response.choices:
-                    return response.choices[0].message.content
-                elif isinstance(response, str):
+                if isinstance(response, str):
                     return response
+
+                # Проверка наличия атрибута choices и того, что он не None / не пустой
+                choices = getattr(response, 'choices', None)
+                if choices and len(choices) > 0:
+                    first_choice = choices[0]
+                    message = getattr(first_choice, 'message', None)
+                    if message:
+                        return getattr(message, 'content', None)
+
             except Exception as e:
                 logger.debug(f"Ошибка провайдера {provider.__name__}: {e}")
             return None
@@ -246,7 +227,7 @@ class AIClient:
             try:
                 logger.info(f"[{request_id}] Пробуем сохраненный провайдер: {cached_provider.__name__}")
                 result = await self._try_generate(self.g4f_client, prompt, cached_provider)
-                if result and len(result.strip()) > 0:
+                if result and isinstance(result, str) and len(result.strip()) > 0:
                     return result
             except Exception as e:
                 logger.warning(f"[{request_id}] Сохраненный {cached_provider.__name__} выбил ошибку. Бан за сбой!")
@@ -259,6 +240,9 @@ class AIClient:
         for provider in available_providers:
             try:
                 result = await self._try_generate(self.g4f_client, prompt, provider)
+                if not result or not isinstance(result, str):
+                    continue
+
                 res_clean = result.strip()
                 res_lower = res_clean.lower()
 
@@ -283,6 +267,7 @@ class AIClient:
         logger.error(f"[{request_id}] ❌ Ни один из доступных провайдеров не ответил!")
         return None
 
+
 class RequestManager:
     """Менеджер параллельных запросов"""
 
@@ -292,23 +277,19 @@ class RequestManager:
         self.lock = asyncio.Lock()
 
     async def add_request(self, request_id: str, task: asyncio.Task):
-        """Добавить активный запрос"""
         async with self.lock:
             self.active_requests[request_id] = task
 
     async def remove_request(self, request_id: str):
-        """Удалить завершенный запрос"""
         async with self.lock:
             if request_id in self.active_requests:
                 del self.active_requests[request_id]
 
     async def get_active_count(self) -> int:
-        """Получить количество активных запросов"""
         async with self.lock:
             return len(self.active_requests)
 
     async def process_request(self, request_id: str, coro):
-        """Обработать запрос с ограничением параллелизма"""
         async with self.semaphore:
             task = asyncio.create_task(coro)
             await self.add_request(request_id, task)
@@ -328,7 +309,6 @@ class MessageProcessor:
         ]
 
     def should_respond(self, message: types.Message, bot_username: str) -> bool:
-        """Определить, должен ли бот отвечать на сообщение"""
         if not message.text:
             return False
 
@@ -399,6 +379,7 @@ async def get_image_url(message: types.Message, request_id: str) -> Optional[str
         logger.error(f"[{request_id}] Ошибка получения URL изображения: {e}")
         return None
 
+
 def get_sender_name(msg: types.Message) -> str:
     if msg.from_user:
         return msg.from_user.full_name
@@ -406,8 +387,8 @@ def get_sender_name(msg: types.Message) -> str:
         return msg.sender_chat.title or "Канал"
     return "Неизвестный"
 
+
 def build_conversation_context(original: types.Message, reply: types.Message, request_id: str) -> ConversationContext:
-    """Построить контекст разговора"""
     original_sender = get_sender_name(original)
     reply_sender = get_sender_name(reply)
     original_text = original.text or original.caption or ""
@@ -444,7 +425,6 @@ async def generate_jirinovsky_response(context: ConversationContext) -> str:
                     logger.warning(f"[{context.request_id}] Не удалось получить описание изображения.")
                     image_analysis = "\n[Изображение не удалось проанализировать]"
 
-        # Формируем промпт для ИИ
         prompt = (
             f"{config.SYSTEM_PROMPT}\n\n"
             f"КОНТЕКСТ БЕСЕДЫ:\n"
@@ -461,10 +441,9 @@ async def generate_jirinovsky_response(context: ConversationContext) -> str:
 
         logger.info(f"[{context.request_id}] Генерируем ответ для {context.reply_sender}")
 
-        # ТОЛЬКО g4f для текста
         response = await ai_client.generate_text_response(prompt, context.request_id)
 
-        if response:
+        if response and isinstance(response, str) and len(response.strip()) > 0:
             logger.info(f"[{context.request_id}] ✅ Успешно сгенерирован ответ")
             return response
 
@@ -480,13 +459,11 @@ async def process_message_with_context(context: ConversationContext):
     """Асинхронная обработка сообщения с контекстом"""
     response = None
     try:
-        # Отправляем статус "печатает"
         await bot.send_chat_action(context.chat_id, "typing")
 
-        # Генерируем ответ
         response = await generate_jirinovsky_response(context)
         clean_response = clean_telegram_html(response)
-        # Отправляем ответ
+
         await bot.send_message(
             chat_id=context.chat_id,
             text=clean_response,
@@ -498,7 +475,8 @@ async def process_message_with_context(context: ConversationContext):
     except Exception as e:
         logger.error(f"[{context.request_id}] Ошибка отправки ответа: {e}")
         with suppress(Exception):
-            logger.error(f"[{request_id}] Ошибка обработки сообщения: {e} \n Сообщение от бота: {response}")
+            # Исправлен баг: context.request_id вместо request_id
+            logger.error(f"[{context.request_id}] Ошибка обработки сообщения: {e} \n Сообщение от бота: {response}")
             await bot.send_message(
                 chat_id=context.chat_id,
                 text="Пфф! Не могу ответить! Система загружена провокациями!"
@@ -507,10 +485,8 @@ async def process_message_with_context(context: ConversationContext):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    """Обработчик команды /start"""
-
     await message.answer(
-        f"Дорогой! Я бот-Жириновский!"
+        "Дорогой! Я бот-Жириновский!"
         "Добавь меня в группу и упомяни в ответе на сообщение - "
         "и я дам свой острый комментарий!"
     )
@@ -518,7 +494,6 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
-    """Показать статус бота"""
     active_requests = await request_manager.get_active_count()
 
     await message.answer(
@@ -530,7 +505,6 @@ async def cmd_status(message: types.Message):
 
 @dp.message(Command("ptichko"))
 async def cmd_ptichko(message: types.Message):
-    """Обработчик команды /ptichko"""
     try:
         rand_num = random.randint(1, 10)
         if rand_num >= 9:
@@ -548,7 +522,6 @@ async def cmd_ptichko(message: types.Message):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_group_messages(message: types.Message):
-    """Обработчик сообщений в группах"""
     request_id = str(uuid.uuid4())[:8]
 
     try:
@@ -569,7 +542,6 @@ async def handle_group_messages(message: types.Message):
 
         logger.info(f"[{request_id}] Запускаем обработку для {context.reply_sender}")
 
-        # Запускаем асинхронную обработку
         await asyncio.create_task(
             request_manager.process_request(
                 request_id,
@@ -586,7 +558,6 @@ async def handle_group_messages(message: types.Message):
 
 @dp.message(F.chat.type == "private")
 async def handle_private_messages(message: types.Message):
-    """Обработчик личных сообщений"""
     await message.answer(
         "Дорогой! Я работаю только в группах! "
         "Добавь меня в группу, собери аудиторию, и тогда я покажу всю свою мощь!"
@@ -594,7 +565,6 @@ async def handle_private_messages(message: types.Message):
 
 
 async def on_startup():
-    """Действия при запуске бота"""
     bot_info = await bot.me()
     logger.info("=" * 50)
     logger.info("🚀 Бот запущен!")
@@ -603,7 +573,6 @@ async def on_startup():
 
 
 async def on_shutdown():
-    """Действия при остановке бота"""
     logger.info("🛑 Бот останавливается...")
     active_count = await request_manager.get_active_count()
     if active_count > 0:
@@ -613,7 +582,6 @@ async def on_shutdown():
 
 
 async def main():
-    """Основная функция"""
     try:
         dp.startup.register(on_startup)
         dp.shutdown.register(on_shutdown)
@@ -621,9 +589,8 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("🌐 Начинаем поллинг...")
         bot_info = await bot.me()
-        dp["bot_name"] = bot_info
+        dp["bot_name"] = bot_info.username
         await dp.start_polling(bot)
-
 
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}")
