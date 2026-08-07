@@ -453,6 +453,7 @@ async def generate_jirinovsky_response(context: ConversationContext) -> str:
 
 async def process_message_with_context(context: ConversationContext):
     """Асинхронная обработка сообщения с контекстом"""
+    response = None
     try:
         # Отправляем статус "печатает"
         await bot.send_chat_action(context.chat_id, "typing")
@@ -472,6 +473,7 @@ async def process_message_with_context(context: ConversationContext):
     except Exception as e:
         logger.error(f"[{context.request_id}] Ошибка отправки ответа: {e}")
         with suppress(Exception):
+            logger.error(f"[{request_id}] Ошибка обработки сообщения: {e} \n Сообщение от бота: {response}")
             await bot.send_message(
                 chat_id=context.chat_id,
                 text="Пфф! Не могу ответить! Система загружена провокациями!"
