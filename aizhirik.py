@@ -70,13 +70,6 @@ import inspect
 import g4f.Provider
 from g4f.providers.base_provider import BaseProvider
 
-
-import time
-import inspect
-import g4f.Provider
-from g4f.providers.base_provider import BaseProvider
-
-
 class DynamicProviderManager:
     """Динамический менеджер провайдеров с кешированием и временным баном (cooldown)"""
 
@@ -124,16 +117,15 @@ class DynamicProviderManager:
     def get_available_providers(self):
         """Возвращает список провайдеров, у которых ИСТЕК срок бана"""
         now = time.time()
-        available = []
+        self.banned_providers = {
+            p: t for p, t in self.banned_providers.items() if t > now
+        }
+        available = [p for p in self.all_providers if p not in self.banned_providers]
 
-        for provider in self.all_providers:
-            if provider in self.banned_providers:
-                if now >= self.banned_providers[provider]:
-                    del self.banned_providers[provider]  # Снимаем бан
-                    logger.info(f"🔄 Провайдер {provider.__name__} разбанен и возвращен в строй!")
-                    available.append(provider)
-            else:
-                available.append(provider)
+        if not available and self.all_providers:
+            logger.warning("Все провайдеры в бане! Принудительный сброс банов.")
+            self.banned_providers.clear()
+            available = list(self.all_providers)
 
         return available
 
@@ -144,8 +136,9 @@ class AIClient:
     def __init__(self, ollama_host: str, ollama_token: str):
         self.ollama_host = ollama_host
         self.ollama_token = ollama_token
-        # 1. Инициализируем менеджер провайдеров
         self.provider_manager = DynamicProviderManager()
+
+        self.g4f_client = G4FClient()
 
     async def analyze_image(self, image_data: bytes, request_id: str) -> Optional[str]:
         """Анализирует изображение через Ollama Cloud API"""
@@ -196,32 +189,37 @@ class AIClient:
         except Exception as e:
             logger.warning(f"[{request_id}] Ошибка анализа изображения: {e}")
             return None
-    # 2. Добавлен неблокирующий метод выполнения запроса в отдельном потоке
     async def _try_generate(self, client: G4FClient, prompt: str, provider) -> Optional[str]:
         """Запускает синхронный вызов g4f в отдельном потоке executor"""
         loop = asyncio.get_running_loop()
 
         def _sync_call():
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                provider=provider,
-                messages=[{"role": "user", "content": prompt}],
-                timeout=20
-            )
-            return response.choices[0].message.content
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    provider=provider,
+                    messages=[{"role": "user", "content": prompt}],
+                    timeout=20
+                )
+                if hasattr(response, 'choices') and response.choices:
+                    return response.choices[0].message.content
+                elif isinstance(response, str):
+                    return response
+            except Exception as e:
+                logger.debug(f"Ошибка провайдера {provider.__name__}: {e}")
+            return None
 
         return await loop.run_in_executor(None, _sync_call)
 
     async def generate_text_response(self, prompt: str, request_id: str) -> Optional[str]:
         """Генерирует текстовый ответ с автоматическим выбором и баном провайдеров"""
-        client = G4FClient()
 
         # Шаг A: Пробуем закешированного проверенного провайдера
         cached_provider = self.provider_manager.get_working_provider()
         if cached_provider:
             try:
                 logger.info(f"[{request_id}] Пробуем сохраненный провайдер: {cached_provider.__name__}")
-                result = await self._try_generate(client, prompt, cached_provider)
+                result = await self._try_generate(self.g4f_client, prompt, cached_provider)
                 if result and len(result.strip()) > 0:
                     return result
             except Exception as e:
@@ -234,7 +232,7 @@ class AIClient:
 
         for provider in available_providers:
             try:
-                result = await self._try_generate(client, prompt, provider)
+                result = await self._try_generate(self.g4f_client, prompt, provider)
                 res_clean = result.strip()
                 res_lower = res_clean.lower()
 
@@ -375,11 +373,17 @@ async def get_image_url(message: types.Message, request_id: str) -> Optional[str
         logger.error(f"[{request_id}] Ошибка получения URL изображения: {e}")
         return None
 
+def get_sender_name(msg: types.Message) -> str:
+    if msg.from_user:
+        return msg.from_user.full_name
+    if msg.sender_chat:
+        return msg.sender_chat.title or "Канал"
+    return "Неизвестный"
 
 def build_conversation_context(original: types.Message, reply: types.Message, request_id: str) -> ConversationContext:
     """Построить контекст разговора"""
-    original_sender = original.from_user.full_name
-    reply_sender = reply.from_user.full_name
+    original_sender = get_sender_name(original)
+    reply_sender = get_sender_name(reply)
     original_text = original.text or original.caption or ""
     reply_text = reply.text or reply.caption or ""
 
@@ -521,7 +525,7 @@ async def handle_group_messages(message: types.Message):
     request_id = str(uuid.uuid4())[:8]
 
     try:
-        bot_username = (await bot.me()).username.lower()
+        bot_username = dp["bot_name"]
         logger.info(f"[{request_id}] Сообщение от {message.from_user.full_name} в чате {message.chat.id}")
 
         if not processor.should_respond(message, bot_username):
@@ -589,7 +593,10 @@ async def main():
 
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("🌐 Начинаем поллинг...")
+        bot_info = await bot.me()
+        dp["bot_name"] = bot_info
         await dp.start_polling(bot)
+
 
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}")
