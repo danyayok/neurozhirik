@@ -208,6 +208,7 @@ class AIClient:
         except Exception as e:
             logger.warning(f"[{request_id}] Ошибка анализа изображения: {e}")
             return None
+
     async def _try_generate(self, client: G4FClient, prompt: str, provider) -> Optional[str]:
         """Запускает синхронный вызов g4f в отдельном потоке executor"""
         loop = asyncio.get_running_loop()
@@ -220,6 +221,11 @@ class AIClient:
                     messages=[{"role": "user", "content": prompt}],
                     timeout=20
                 )
+
+                # Проверяем, что response существует и не равен None
+                if response is None:
+                    return None
+
                 if hasattr(response, 'choices') and response.choices:
                     return response.choices[0].message.content
                 elif isinstance(response, str):
